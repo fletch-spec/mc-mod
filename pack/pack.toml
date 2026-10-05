@@ -1,0 +1,13 @@
+name = "minecraft-mod"
+author = "Fletcher C."
+version = "0.1.0"
+pack-format = "packwiz:1.1.0"
+
+[index]
+file = "index.toml"
+hash-format = "sha256"
+hash = "08dcfdbaad19d007896e6565d8a2b486ccf1a08fe35d2d331a5b56e09a971ff0"
+
+[versions]
+minecraft = "26.2"
+fabric = "0.19.5"

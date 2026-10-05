@@ -1,0 +1,6 @@
+# The server folder is mostly generated. Keep only hand-edited config in git.
+server/*
+!server/server.properties
+!server/config/
+state/
+__pycache__/

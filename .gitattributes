@@ -1,0 +1,2 @@
+# packwiz hashes the exact bytes of these files; never convert line endings.
+pack/** -text

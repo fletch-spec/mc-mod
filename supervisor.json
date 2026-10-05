@@ -1,0 +1,10 @@
+{
+  "server_dir": "C:\\Users\\fletc\\Desktop\\minecraft-mod\\server",
+  "java_cmd": ["java", "-Xms2G", "-Xmx6G", "-XX:+UseG1GC", "-XX:+ParallelRefProcEnabled",
+               "-XX:MaxGCPauseMillis=200", "-XX:+DisableExplicitGC", "-XX:+AlwaysPreTouch",
+               "-jar", "fabric-server-launch.jar", "nogui"],
+  "backup_dir": "D:\\mc-backups\\minecraft-mod",
+  "backup_keep": 10,
+  "api_port": 47803,
+  "hold_file": "C:\\Users\\fletc\\Desktop\\minecraft-mod\\state\\deploy.hold"
+}
