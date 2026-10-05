@@ -11,7 +11,9 @@ the hold -> start -> wait for "Running". If the server doesn't come up, the
 snapshot is restored and it starts again on the old mods.
 
 Never touches Java directly: start/stop always go through the supervisor
-(127.0.0.1:47803, see ../supervisor.json). Result goes to state/deploy.json,
+(127.0.0.1:47803, see ../supervisor.json). The dashboard's Stop closes the
+supervisor, so a closed one means "stopped", and starting launches its
+scheduled task ("task" in supervisor.json) first. Result goes to state/deploy.json,
 which the wallpaper dashboard shows; output is appended to state/deploy.log.
 """
 import argparse
@@ -38,6 +40,7 @@ HOLD = Path(CFG["hold_file"])
 API = f"http://127.0.0.1:{CFG['api_port']}"
 TOKEN_FILE = Path(r"C:\discord\control_token.txt")
 START_TIMEOUT = 300  # seconds for the server to reach "Running"
+SUPERVISOR_WAIT = 30  # seconds for a freshly launched supervisor to answer
 
 
 def log(msg):
@@ -65,6 +68,30 @@ def supervisor(method, path, timeout=10):
         raise DeployError(f"The modded server's supervisor isn't reachable ({e}).") from e
 
 
+def supervisor_up():
+    try:
+        supervisor("GET", "/status", timeout=3)
+        return True
+    except DeployError:
+        return False
+
+
+def ensure_supervisor():
+    """Launch the supervisor's scheduled task if it isn't running, and wait for it."""
+    if supervisor_up():
+        return
+    log(f"Launching the supervisor (task '{CFG['task']}')...")
+    r = subprocess.run(["schtasks", "/run", "/tn", CFG["task"]], capture_output=True, text=True)
+    if r.returncode:
+        raise DeployError(f"Couldn't launch the supervisor: {(r.stderr or r.stdout).strip()}")
+    deadline = time.monotonic() + SUPERVISOR_WAIT
+    while time.monotonic() < deadline:
+        time.sleep(1)
+        if supervisor_up():
+            return
+    raise DeployError(f"The supervisor didn't come up within {SUPERVISOR_WAIT} s.")
+
+
 def wait_until_up():
     deadline = time.monotonic() + START_TIMEOUT
     time.sleep(5)
@@ -79,6 +106,7 @@ def wait_until_up():
 
 
 def start_server():
+    ensure_supervisor()
     log(supervisor("POST", "/mc/start?who=deploy")["message"])
     if wait_until_up():
         log("Server is up.")
@@ -157,6 +185,8 @@ def mod_list():
 
 
 def stop_if_running():
+    if not supervisor_up():
+        return False  # Stop closes the supervisor, so the server is down
     st = supervisor("GET", "/status")
     if st.get("busy") or st.get("backing_up"):
         raise DeployError("The server is busy (stopping or backing up); try again shortly.")

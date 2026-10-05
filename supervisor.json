@@ -7,5 +7,6 @@
   "backup_keep": 10,
   "backup_min_age_hours": 24,
   "api_port": 47803,
+  "task": "Minecraft Supervisor (Mod)",
   "hold_file": "C:\\Users\\fletc\\Desktop\\minecraft-mod\\state\\deploy.hold"
 }
