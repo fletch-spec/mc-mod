@@ -3,12 +3,19 @@
     python deploy.py              pull, sync mods, restart if it was running
     python deploy.py --start      ...and start it even if it was stopped
     python deploy.py --no-pull    use the checkout as it is
-    python deploy.py --rollback   put back the mods from before the last deploy
+    python deploy.py --rollback   put back the mods and launcher from before the last deploy
 
 Steps: git pull -> hold starts -> stop via the supervisor (it saves and backs
-up) -> snapshot mods/ -> packwiz-installer syncs mods/ from pack/ -> release
-the hold -> start -> wait for "Running". If the server doesn't come up, the
-snapshot is restored and it starts again on the old mods.
+up) -> snapshot mods/ and the launcher -> match the Fabric launcher to
+pack.toml's minecraft and fabric versions -> packwiz-installer syncs mods/
+from pack/ -> release the hold -> start -> wait for "Running". If the server
+doesn't come up, the snapshot is restored and it starts again on the old mods.
+
+The launcher is Fabric's server launcher jar (fabric-server-launch.jar), which
+has its Minecraft and loader versions built in and downloads the rest on first
+start. When pack.toml asks for other versions, the matching jar comes from
+Fabric's meta API, and the Minecraft server jar it needs is copied from the
+vanilla server (C:\\minecraft, only ever read) if that one is the same version.
 
 Never touches Java directly: start/stop always go through the supervisor
 (127.0.0.1:47803, see ../supervisor.json). The dashboard's Stop closes the
@@ -23,8 +30,10 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +43,10 @@ STATE = ROOT / "state"
 LOCK = STATE / "deploy.lock"
 RESULT = STATE / "deploy.json"
 SNAPSHOT = STATE / "rollback" / "mods"
+LAUNCHER_SNAPSHOT = STATE / "rollback" / "launcher"
+LAUNCHER = SERVER / "fabric-server-launch.jar"
+VANILLA_JAR = Path(r"C:\minecraft\server.jar")  # the vanilla server's; only ever read
+FABRIC_META = "https://meta.fabricmc.net/v2"
 BOOTSTRAP = ROOT / "tools" / "packwiz-installer-bootstrap.jar"
 CFG = json.loads((ROOT / "supervisor.json").read_text(encoding="utf-8"))
 HOLD = Path(CFG["hold_file"])
@@ -142,20 +155,99 @@ def pull():
     log(git("pull", "--ff-only") or "Pulled.")
 
 
+# ---------- launcher ----------
+
+def launcher_versions(jar=LAUNCHER):
+    """(minecraft, fabric) that a Fabric server launcher jar launches, or None."""
+    try:
+        with zipfile.ZipFile(jar) as z:
+            props = z.read("install.properties").decode("utf-8")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return None
+    kv = dict(line.split("=", 1) for line in props.splitlines() if "=" in line)
+    return kv.get("game-version"), kv.get("fabric-loader-version")
+
+
+def server_jar(mc):
+    """Where the launcher keeps (or downloads) the Minecraft server jar."""
+    return SERVER / ".fabric" / "server" / f"{mc}-server.jar"
+
+
+def jar_version(jar):
+    """Minecraft version of a vanilla server jar, or None."""
+    try:
+        with zipfile.ZipFile(jar) as z:
+            return json.loads(z.read("version.json"))["id"]
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        return None
+
+
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "minecraft-mod-pipeline/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as res:
+            return res.read()
+    except OSError as e:
+        raise DeployError(f"Couldn't download {url} ({e}).") from e
+
+
+def sync_launcher():
+    """Make the launcher match pack.toml. Returns a change note, or None if it already did."""
+    with open(ROOT / "pack" / "pack.toml", "rb") as f:
+        want = tomllib.load(f)["versions"]
+    mc, loader = want["minecraft"], want["fabric"]
+    have = launcher_versions()
+    if have == (mc, loader):
+        return None
+    log(f"Switching the launcher to Minecraft {mc}, Fabric {loader}...")
+    installers = json.loads(fetch(f"{FABRIC_META}/versions/installer"))
+    installer = next(v["version"] for v in installers if v["stable"])
+    tmp = LAUNCHER.with_suffix(".tmp")
+    tmp.write_bytes(fetch(f"{FABRIC_META}/versions/loader/{mc}/{loader}/{installer}/server/jar"))
+    got = launcher_versions(tmp)
+    if got != (mc, loader):
+        tmp.unlink()
+        raise DeployError(f"Fabric's meta API returned a launcher for {got}, "
+                          f"not Minecraft {mc} with Fabric {loader}.")
+    tmp.replace(LAUNCHER)
+
+    dest = server_jar(mc)
+    if dest.exists():
+        log(f"  Minecraft {mc}'s server jar is already there.")
+    elif jar_version(VANILLA_JAR) == mc:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(VANILLA_JAR, dest.with_suffix(".tmp"))
+        dest.with_suffix(".tmp").replace(dest)
+        log(f"  Copied the Minecraft {mc} server jar from {VANILLA_JAR}.")
+    else:
+        log(f"  The launcher will download Minecraft {mc} on first start.")
+    old = f"{have[0]}/{have[1]}" if have else "none"
+    return f"launcher {old} -> {mc}/{loader}"
+
+
+# ---------- snapshot ----------
+
 # packwiz.json is packwiz-installer's record of the files it manages. It's
 # snapshotted with mods/ so that after a rollback the record still matches the
 # jars on disk, and the next sync replaces them instead of leaving duplicates.
+# The launcher is snapshotted with the Minecraft server jar it launches.
 
-def snapshot_mods():
+def snapshot():
     shutil.rmtree(SNAPSHOT.parent, ignore_errors=True)
     SNAPSHOT.parent.mkdir(parents=True)
     if (SERVER / "mods").exists():
         shutil.copytree(SERVER / "mods", SNAPSHOT)
     if (SERVER / "packwiz.json").exists():
         shutil.copy2(SERVER / "packwiz.json", SNAPSHOT.parent / "packwiz.json")
+    if LAUNCHER.exists():
+        LAUNCHER_SNAPSHOT.mkdir()
+        shutil.copy2(LAUNCHER, LAUNCHER_SNAPSHOT / LAUNCHER.name)
+        have = launcher_versions()
+        if have and server_jar(have[0]).exists():
+            shutil.copy2(server_jar(have[0]), LAUNCHER_SNAPSHOT / server_jar(have[0]).name)
 
 
-def restore_mods():
+def restore():
     if not SNAPSHOT.parent.exists():
         raise DeployError("No rollback snapshot to restore.")
     shutil.rmtree(SERVER / "mods", ignore_errors=True)
@@ -166,7 +258,17 @@ def restore_mods():
         shutil.copy2(record, SERVER / "packwiz.json")
     else:
         (SERVER / "packwiz.json").unlink(missing_ok=True)
-    log("Restored mods/ from the snapshot.")
+    if not LAUNCHER_SNAPSHOT.exists():  # snapshot from before launchers were kept
+        log("Restored mods/ from the snapshot.")
+        return
+    for f in LAUNCHER_SNAPSHOT.iterdir():
+        if f.name == LAUNCHER.name:
+            shutil.copy2(f, LAUNCHER)
+        else:  # the Minecraft server jar
+            server_jar("").parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, server_jar("").parent / f.name)
+    have = launcher_versions() or ("?", "?")
+    log(f"Restored mods/ and the launcher (Minecraft {have[0]}, Fabric {have[1]}) from the snapshot.")
 
 
 def sync_mods():
@@ -203,25 +305,27 @@ def deploy(a):
         HOLD.touch()
         try:
             was_running = stop_if_running()
-            restore_mods()
+            restore()
         finally:
             HOLD.unlink(missing_ok=True)
         ok = start_server() if (was_running or a.start) else True
-        return ok, "Rolled back to the mods from before the last deploy."
+        return ok, "Rolled back to the mods and launcher from before the last deploy."
 
     if not a.no_pull:
         pull()
     HOLD.touch()  # the supervisor refuses starts (Steve, dashboard) while we swap files
     try:
         was_running = stop_if_running()
-        snapshot_mods()
+        snapshot()
         before = set(mod_list())
-        log("Syncing mods from pack/...")
+        launcher_change = None
         try:
+            launcher_change = sync_launcher()
+            log("Syncing mods from pack/...")
             sync_mods()
             sync_error = None
         except DeployError as e:
-            restore_mods()
+            restore()
             sync_error = e
         after = set(mod_list())
     finally:
@@ -233,6 +337,9 @@ def deploy(a):
 
     changes = [f"+{m}" for m in sorted(after - before)] + [f"-{m}" for m in sorted(before - after)]
     log("Mod changes: " + (", ".join(changes) or "none"))
+    if launcher_change:
+        log("Launcher: " + launcher_change)
+        changes.append(launcher_change)
     if not (was_running or a.start):
         return True, f"Synced ({len(changes)} change(s)); server left stopped."
     if start_server():
@@ -241,7 +348,7 @@ def deploy(a):
     log("Rolling back to the previous mods...")
     HOLD.touch()
     try:
-        restore_mods()
+        restore()
     finally:
         HOLD.unlink(missing_ok=True)
     if start_server():
@@ -253,7 +360,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--start", action="store_true", help="start the server even if it was stopped")
     ap.add_argument("--no-pull", action="store_true", help="don't git pull first")
-    ap.add_argument("--rollback", action="store_true", help="restore the mods from before the last deploy")
+    ap.add_argument("--rollback", action="store_true", help="restore the mods and launcher from before the last deploy")
     a = ap.parse_args()
 
     STATE.mkdir(exist_ok=True)
